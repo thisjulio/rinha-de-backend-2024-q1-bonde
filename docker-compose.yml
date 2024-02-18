@@ -53,26 +53,37 @@ services:
           cpus: "0.1"
           memory: "50MB"
 
+  # db:
+  #   image: postgres:latest
+  #   hostname: db
+  #   environment:
+  #     - POSTGRES_PASSWORD=123
+  #     - POSTGRES_USER=admin
+  #     - POSTGRES_DB=rinha
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - ./script.sql:/docker-entrypoint-initdb.d/script.sql
+  #     - ./postgresql.conf:/docker-entrypoint-initdb.d/postgresql.conf
+  #   command: postgres -c config_file=/docker-entrypoint-initdb.d/postgresql.conf
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         # Note que a soma de todos os limites dos serviços
+  #         # aqui declarados é de 1.5 unidades de CPU e 550MB
+  #         # de memória. A distribuição feita aqui é apenas
+  #         # um exemplo – distribua como quiser.
+  #         cpus: "0.5"
+  #         memory: "200MB"
+
   db:
-    image: postgres:latest
-    hostname: db
-    environment:
-      - POSTGRES_PASSWORD=123
-      - POSTGRES_USER=admin
-      - POSTGRES_DB=rinha
+    image: redis:7.2-alpine
+    hostname: redis
     ports:
-      - "5432:5432"
-    volumes:
-      - ./script.sql:/docker-entrypoint-initdb.d/script.sql
-      - ./postgresql.conf:/docker-entrypoint-initdb.d/postgresql.conf
-    command: postgres -c config_file=/docker-entrypoint-initdb.d/postgresql.conf
+      - "6379:6379"
     deploy:
       resources:
         limits:
-          # Note que a soma de todos os limites dos serviços
-          # aqui declarados é de 1.5 unidades de CPU e 550MB
-          # de memória. A distribuição feita aqui é apenas
-          # um exemplo – distribua como quiser.
           cpus: "0.5"
           memory: "200MB"
 

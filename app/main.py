@@ -1,18 +1,20 @@
 import asyncio
 import datetime
+from http import client
+import json
 import os
 from enum import Enum
 from typing import List
+from webbrowser import get
 
-import asyncpg
+import aioredis
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
 class FastAPIWithDatabase(FastAPI):
-    database_connection: asyncpg.Connection = None
-    database_pool: asyncpg.Pool = None
+    redis: aioredis.Redis = None
 
 
 app = FastAPIWithDatabase()
@@ -54,53 +56,85 @@ def read_root():
     return {"Hello": "World"}
 
 
-client_cache = {}
-
-
+# Client_{id}_limit -> int
 async def fetch_client_from_db(id: int):
-    if id in client_cache:
-        return client_cache[id]
+    client_limit = await app.redis.get(f"Client_{id}_limit")
+    
+    if not client_limit:
+        return {}
+    
+    result = {}
+    result["id"] = id
+    result["limite"] = int(client_limit)
 
-    async with app.database_pool.acquire() as connection:
-        query = "SELECT * FROM clientes WHERE id = $1"
-        client_cache[id] = await connection.fetchrow(query, id)
-        return client_cache[id]
+    return result
 
 
+# Client_{id}_balance -> json{valor: int}
 async def credit_balance_in_db(cliente_id: int, change_value: int):
-    async with app.database_pool.acquire() as connection:
-        async with connection.transaction():
-            query = "UPDATE saldos SET valor = valor + $1 WHERE cliente_id = $2 RETURNING valor"
-            result = await connection.fetchrow(query, change_value, cliente_id)
-            return result
+    async with app.redis.pipeline() as pipe:
+        await pipe.incr(f"Client_{cliente_id}_balance", change_value)
+        res = await pipe.execute()
+        result = {}
+        result["valor"] = res[0]
+        return result
 
 
 async def debit_balance_in_db(cliente_id: int, change_value: int, limit: int):
-    async with app.database_pool.acquire() as connection:
-        async with connection.transaction():
-            query = "UPDATE saldos SET valor = valor - $1 WHERE (cliente_id = $2) and (abs(valor - $1) <= $3) RETURNING valor"
-            result = await connection.fetchrow(query, change_value, cliente_id, limit)
-            if not result:
-                raise ValueError("Limite Insuficiente")
-            return result
+    current_balance = await get_balance_from_db(cliente_id)    
+    if not current_balance:
+        raise ValueError("Saldo não encontrado")
+    
+    elif current_balance["valor"] - change_value < -limit:
+        raise HTTPException(status_code=422, detail="Limite de crédito ultrapassado")
+    
+    async with app.redis.pipeline() as pipe:
+        await pipe.decr(f"Client_{cliente_id}_balance", change_value)
+        res = await pipe.execute()
+        result = {}
+        result["valor"] = res[0]
+        return result
 
-
+# Transaction -> json{id: int, valor: int, tipo: str, descricao: str, realizada_em: str}
 async def create_transaction_in_db(cliente_id: int, transaction: TransactionInput):
-    async with app.database_pool.acquire() as connection:
-        query = "INSERT INTO transacoes (cliente_id, valor, tipo, descricao, realizada_em) VALUES ($1, $2, $3, $4, $5) RETURNING *"
-        await connection.fetchrow(query, cliente_id, transaction.valor, transaction.tipo, transaction.descricao, datetime.datetime.now())
+    current_statement = await app.redis.get(f"Client_{cliente_id}_statement")
+    current_statement = json.loads(current_statement) if current_statement else []
+    transaction_to_store = {**transaction.dict(), "realizada_em": datetime.datetime.now().isoformat()}
+
+    if not current_statement:
+        new_statement = [transaction_to_store]
+        await app.redis.set(f"Client_{cliente_id}_statement", json.dumps(new_statement))
+        return
+
+    new_statement = [*current_statement, transaction_to_store][-10:][::-1]
+    await app.redis.set(f"Client_{cliente_id}_statement", json.dumps(new_statement))
 
 
 async def get_statement_from_db(cliente_id: int):
-    async with app.database_pool.acquire() as connection:
-        query = "SELECT * FROM transacoes WHERE cliente_id = $1 ORDER BY realizada_em DESC LIMIT 10 OFFSET 0"
-        return await connection.fetch(query, cliente_id)
+    current_statement = await app.redis.get(f"Client_{cliente_id}_statement")
+    current_statement = json.loads(current_statement) if current_statement else []
+    if not current_statement:
+        return []
+
+    result = [
+        {
+            "valor": t['valor'],
+            "tipo": t['tipo'],
+            "descricao": t['descricao'],
+            "realizada_em": t['realizada_em']
+        } for t in current_statement
+    ]
+
+    return result
 
 
 async def get_balance_from_db(cliente_id: int):
-    async with app.database_pool.acquire() as connection:
-        query = "SELECT * FROM saldos WHERE cliente_id = $1"
-        return await connection.fetchrow(query, cliente_id)
+    async with app.redis.pipeline() as pipe: 
+        await pipe.get(f"Client_{cliente_id}_balance")
+        current_balance = (await pipe.execute())[0]
+        result = {}
+        result["valor"] = int(current_balance) if current_balance else 0
+        return result
 
 
 @app.post("/clientes/{id}/transacoes", response_model=TransactionOutput)
@@ -144,7 +178,7 @@ async def get_extrato(id: int):
                 valor=t['valor'],
                 tipo=t['tipo'],
                 descricao=t['descricao'],
-                realizada_em=t['realizada_em'].isoformat()
+                realizada_em=t['realizada_em']
             )
             for t in statement
         ]
@@ -155,25 +189,39 @@ async def start_connection():
     db_host = os.getenv("DB_HOSTNAME", "localhost")
     while True:
         try:
-            app.database_connection = await asyncpg.connect(f'postgresql://admin:123@{db_host}/rinha')
-            app.database_pool = await asyncpg.create_pool(f'postgresql://admin:123@{db_host}/rinha')
+            app.redis = await aioredis.from_url(f"redis://{db_host}")
             break
         except ConnectionError as e:
             print("Database connection error, will sleep for 5 seconds:", e)
             await asyncio.sleep(5)
 
 
+async def init_clients():
+    clients = [
+        (1, 1000 * 100),
+        (2, 800 * 100),
+        (3, 10000 * 100),
+        (4, 100000 * 100),
+        (5, 5000 * 100)
+    ]
+    for client_id, limit in clients:
+        await app.redis.set(f"Client_{client_id}_limit", limit)
+        await app.redis.set(f"Client_{client_id}_balance", 0)
+        await app.redis.set(f"Client_{client_id}_statement", "[]")
+    
+
 @app.on_event("startup")
 async def _startup():
     await start_connection()
+    await init_clients()
     print("Starting up...")
 
 app.on_event("shutdown")
 
 
 async def _shutdown():
-    if app.database_connection:
-        await app.database_connection.close()
+    if app.redis:
+        await app.redis.close()
     print("Shutting down...")
 
 if __name__ == "__main__":
