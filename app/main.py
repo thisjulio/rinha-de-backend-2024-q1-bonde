@@ -81,19 +81,37 @@ async def credit_balance_in_db(cliente_id: int, change_value: int):
 
 
 async def debit_balance_in_db(cliente_id: int, change_value: int, limit: int):
-    current_balance = await get_balance_from_db(cliente_id)    
-    if not current_balance:
-        raise ValueError("Saldo não encontrado")
-    
-    elif current_balance["valor"] - change_value < -limit:
-        raise HTTPException(status_code=422, detail="Limite de crédito ultrapassado")
-    
-    async with app.redis.pipeline() as pipe:
-        await pipe.decr(f"Client_{cliente_id}_balance", change_value)
-        res = await pipe.execute()
-        result = {}
-        result["valor"] = res[0]
-        return result
+    tentativas = 0  
+    while tentativas < 3:
+        try:
+            async with app.redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(f"Client_{cliente_id}_balance")
+                current_balance = await pipe.get(f"Client_{cliente_id}_balance")
+                
+                if current_balance is None:
+                    raise ValueError("Saldo não encontrado")
+                
+                current_balance = int(current_balance.decode())
+                new_value = current_balance - change_value
+                
+                if new_value < -limit:
+                    raise HTTPException(status_code=422, detail="Limite de crédito ultrapassado")
+
+                pipe.multi()
+                await pipe.set(f"Client_{cliente_id}_balance", new_value)
+                
+                res = await pipe.execute()
+
+                if res:
+                    result = {}
+                    result["valor"] = res[0]
+                    return result
+                else:
+                    raise aioredis.WatchError
+        except aioredis.WatchError:
+                tentativas = tentativas + 1
+                continue
+        
 
 # Transaction -> json{id: int, valor: int, tipo: str, descricao: str, realizada_em: str}
 async def create_transaction_in_db(cliente_id: int, transaction: TransactionInput):
